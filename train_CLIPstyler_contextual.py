@@ -34,6 +34,11 @@ parser.add_argument('--lambda_patch', type=float, default=9000,
                     help='PatchCLIP loss parameter')
 parser.add_argument('--lambda_dir', type=float, default=500,
                     help='directional loss parameter')
+parser.add_argument('--lambda_patch_context', type=float, default=7000,
+                    help='Context loss parameter')
+parser.add_argument('--lambda_global_context', type=float, default=20,
+                    help='Context loss parameter')
+
 parser.add_argument('--lambda_c', type=float, default=150,
                     help='content loss parameter')
 parser.add_argument('--crop_size', type=int, default=128,
@@ -101,6 +106,80 @@ def get_image_prior_losses(inputs_jit):
     loss_var_l2 = torch.norm(diff1) + torch.norm(diff2) + torch.norm(diff3) + torch.norm(diff4)
     
     return loss_var_l2
+
+#Contextual Loss
+# https://gist.github.com/yunjey/3105146c736f9c1055463c33b4c989da
+def contextual_loss(x, y, h=0.5):
+    """Computes contextual loss between x and y.
+
+    Args:
+      x: features of shape (N, C, H, W).
+      y: features of shape (N, C, H, W).
+
+    Returns:
+      cx_loss = contextual loss between x and y (Eq (1) in the paper)
+    """
+    # cx_loss=100.0
+    # print(x.shape)    # 1 * 256
+    # print(y.shape)    # 1 * 256
+    assert x.size() == y.size()
+    N, F = x.size()  # e.g., 10 x 512 x 14 x 14. In this case, the number of points is 196 (14x14).
+    # print(N,F)
+    # y_mu = y.mean(3).mean(2).mean(0).reshape(1, -1, 1, 1)
+    y_mu = y.mean(1).reshape(-1,1)
+    #
+    x_centered = x - y_mu
+    y_centered = y - y_mu
+    x_normalized = x_centered / torch.norm(x_centered, p=2, dim=1, keepdim=True)
+    y_normalized = y_centered / torch.norm(y_centered, p=2, dim=1, keepdim=True)
+    # print(x_normalized.shape, y_normalized.shape)     # (1,256) and (1,256)
+    #
+    # # The equation at the bottom of page 6 in the paper
+    # # Vectorized computation of cosine similarity for each pair of x_i and y_j
+    # x_normalized = x_normalized.reshape(N, C, -1)  # (N, C, F)
+    # y_normalized = y_normalized.reshape(N, C, -1)  # (N, C, F)
+    x_normalized = x_normalized.reshape(N, -1)  # (N, F)
+    y_normalized = y_normalized.reshape(N, -1)  # (N, F)
+    # print(x_normalized.shape, y_normalized.shape)     #  (1,256) and (1,256)
+    # cosine_sim = torch.bmm(x_normalized.transpose(1, 2), y_normalized)  # (N, F, F)
+
+    x_normalized_resize=x_normalized.resize(N, 1,F)
+    y_normalized_resize=y_normalized.resize(N, 1, F)
+    xT_normalized_resize = x_normalized_resize.transpose(1,2)
+    cosine_sim=torch.matmul(xT_normalized_resize, y_normalized_resize)
+    # print(cosine_sim.shape)    #(1,256,256)
+    d = 1 - cosine_sim  # (N, F, F)  d[n, i, j] means d_ij for n-th data
+    # d_min, _ = torch.min(d, dim=2, keepdim=True)  # (N, F, 1)
+    d_min, _ = torch.min(d, dim=2, keepdim=True)  # (N, F, 1)
+
+    # # Eq (2)
+    d_tilde = d / (d_min + 1e-5)
+
+    # # Eq(3)
+    w = torch.exp((1 - d_tilde) / h)
+    # print(w[0][0])   # values range = [0.94----0.98]
+    # print("shapes of d = (%d,%d), d_min = (%d,%d), d_tilde = (%d,%d)" %((d.shape), (d_min.shape),(d_tilde.shape)))
+    # print(d.shape, d_min.shape, d_tilde.shape)     #  (32,256,256) , (32,256,1), (32,256,256)
+    # # Eq(4)
+    # cx_ij = w / torch.sum(w, dim=2, keepdim=True)  # (N, H*W, H*W)
+    cx_ij = w / torch.sum(w, dim=2, keepdim=True)  # (N, H*W, H*W)
+    # print(cx_ij[0][0])   #value range #0.0038, 0.0039, 0.0040
+    # print("shapes of w = (%d,%d), cx_ij = (%d,%d)" %((w.shape),(cx_ij.shape)))
+    # print(w.shape, cx_ij.shape)   # (1,256,256) , (1,256,256)
+
+    # # Eq (1)
+    # cx = torch.mean(torch.max(cx_ij, dim=1)[0], dim=1)  # (N, )
+
+    # print(type(cx))
+
+    cx = 10000*torch.mean(torch.max(cx_ij, dim=1)[0], dim=1)  # (N, )
+    cx_loss = torch.mean(-torch.log(cx + 1e-5))
+    # print("shapes of cx = (%d,%d) and cx_loss= (%d,%d)" %((cx.shape), (cx_loss.shape)) )
+    # print(cx.shape, cx_loss.shape)       # (32) and ([])
+    # print("cx=%.2f and cx_loss=%.2f" %(cx, cx_loss) )
+    # print(cx, cx_loss)
+    return cx_loss
+
 
 def compose_text_with_templates(text: str, templates=imagenet_templates) -> list:
     return [template.format(text) for template in templates]
@@ -185,7 +264,7 @@ for epoch in range(0, steps+1):
     content_loss = 0
 
     content_loss += torch.mean((target_features['conv4_2'] - content_features['conv4_2']) ** 2)
-    content_loss += torch.mean((target_features['conv5_2'] - content_features['conv5_2']) ** 2)    #Content Loss
+    content_loss += torch.mean((target_features['conv5_2'] - content_features['conv5_2']) ** 2)   #Content Loss
 
     loss_patch=0 
     img_proc =[]
@@ -207,20 +286,32 @@ for epoch in range(0, steps+1):
     text_direction /= text_direction.norm(dim=-1, keepdim=True)
     loss_temp = (1- torch.cosine_similarity(img_direction, text_direction, dim=1))
     loss_temp[loss_temp<args.thresh] =0
-    loss_patch+=loss_temp.mean()    #Patch Loss
-    
+    loss_patch+=loss_temp.mean()       # Patch Loss
+
     glob_features = clip_model.encode_image(clip_normalize(target,device))
     glob_features /= (glob_features.clone().norm(dim=-1, keepdim=True))
     
     glob_direction = (glob_features-source_features)
     glob_direction /= glob_direction.clone().norm(dim=-1, keepdim=True)
     
-    loss_glob = (1- torch.cosine_similarity(glob_direction, text_direction, dim=1)).mean()  #Global Loss
-    
-    reg_tv = args.lambda_tv*get_image_prior_losses(target)
+    loss_glob = (1- torch.cosine_similarity(glob_direction, text_direction, dim=1)).mean()    #Global Direction Loss
 
-    total_loss = args.lambda_patch*loss_patch + content_weight * content_loss+ reg_tv+ args.lambda_dir*loss_glob
-    total_loss_epoch.append(total_loss)
+    
+    reg_tv = args.lambda_tv*get_image_prior_losses(target)    #Total Variation Loss
+
+    loss_patch_context = 0
+    loss_patch_temp = contextual_loss(img_direction, text_direction)
+    loss_patch_temp = torch.abs(loss_patch_temp)
+    # loss_patch_temp[loss_patch_temp < args.thresh] = 0
+    loss_patch_context += loss_patch_temp.mean()  # #Context Patch Loss
+
+    # text_direction_column = text_direction.mean(dim=0)
+    # text_direction_column = torch.reshape(text_direction_column, (1,512))
+    # loss_glob_context = contextual_loss(glob_direction, text_direction_column)  #Context Global Loss
+    # total_loss = args.lambda_patch*loss_patch + content_weight * content_loss+ reg_tv+ args.lambda_dir*loss_glob +  args.lambda_patch_context*loss_patch_context + args.lambda_global_context*loss_glob_context
+
+    total_loss = args.lambda_patch * loss_patch + content_weight * content_loss + reg_tv + args.lambda_dir * loss_glob + args.lambda_patch_context * loss_patch_context
+    total_loss_epoch.append(total_loss)     #Total Loss
 
     optimizer.zero_grad()
     total_loss.backward()
@@ -233,6 +324,8 @@ for epoch in range(0, steps+1):
         print('patch loss: ', loss_patch.item())
         print('dir loss: ', loss_glob.item())
         print('TV loss: ', reg_tv.item())
+        print('Patch Context Loss', loss_patch_context.item())
+        # print('Global Context Loss', loss_glob_context.item())
     
     if epoch %50 ==0:
         out_path = './outputs/'+prompt+'_'+content+'_'+exp+'.jpg'
